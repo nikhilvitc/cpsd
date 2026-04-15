@@ -12,7 +12,13 @@ from prepare_kaist_dataset import CLASS_NAMES, NUM_CLASSES
 from rgbt_fusion_model import RGBThermalFusionNet
 
 PEDESTRIAN_CLASS_IDX = CLASS_NAMES.index("pedestrian")
+# Conservative defaults reduce false positives on non-pedestrian images.
 PEDESTRIAN_THRESHOLD = float(os.environ.get("PEDESTRIAN_THRESHOLD", "0.65"))
+PED_MARGIN = float(os.environ.get("PEDESTRIAN_MARGIN", "0.08"))
+CAM_PEAK_THRESHOLD = float(os.environ.get("CAM_PEAK_THRESHOLD", "0.30"))
+MIN_BOX_AREA_RATIO = float(os.environ.get("MIN_BOX_AREA_RATIO", "0.015"))
+REQUIRE_THERMAL = os.environ.get("REQUIRE_THERMAL", "1") == "1"
+DETECTION_MODE = os.environ.get("DETECTION_MODE", "strict").lower()  # recall | balanced | strict
 CHECKPOINT = os.environ.get("PEDESTRIAN_CKPT", "best_model_kaist.pth")
 
 
@@ -56,7 +62,9 @@ def load_model() -> RGBThermalFusionNet:
 MODEL = load_model()
 
 
-def gradcam_localization(rgb_t: torch.Tensor, thm_t: torch.Tensor) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
+def gradcam_localization(
+    rgb_t: torch.Tensor, thm_t: torch.Tensor
+) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, float, float]:
     acts = {}
     grads = {}
 
@@ -77,7 +85,7 @@ def gradcam_localization(rgb_t: torch.Tensor, thm_t: torch.Tensor) -> tuple[np.n
     h2.remove()
 
     if "v" not in acts or "v" not in grads:
-        return None, None
+        return None, None, 0.0, 0.0
 
     a = acts["v"][0]
     g = grads["v"][0]
@@ -86,16 +94,20 @@ def gradcam_localization(rgb_t: torch.Tensor, thm_t: torch.Tensor) -> tuple[np.n
     cam = F.relu(cam)
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-6)
     cam = cam.detach().cpu().numpy()
+    cam_peak = float(cam.max())
 
     cam_u8 = (cam * 255).astype(np.uint8)
     # Box from high activation area (single strongest region).
     mask = cam_u8 >= max(140, int(np.percentile(cam_u8, 95)))
     if not mask.any():
-        return cam, None
+        return cam, None, cam_peak, 0.0
 
     ys, xs = np.where(mask)
     box = (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
-    return cam, box
+    h = max(int(box[3] - box[1] + 1), 1)
+    w = max(int(box[2] - box[0] + 1), 1)
+    area_ratio = float((h * w) / (28.0 * 28.0))
+    return cam, box, cam_peak, area_ratio
 
 
 def apply_overlay(base: Image.Image, cam: np.ndarray | None, box: tuple[int, int, int, int] | None, draw_box: bool) -> Image.Image:
@@ -121,14 +133,30 @@ def apply_overlay(base: Image.Image, cam: np.ndarray | None, box: tuple[int, int
     return out
 
 
-def predict(rgb_image: Image.Image, thermal_image: Image.Image | None):
+def predict(
+    rgb_image: Image.Image,
+    thermal_image: Image.Image | None,
+    pedestrian_threshold: float,
+    ped_margin: float,
+    cam_peak_threshold: float,
+    min_box_area_ratio: float,
+    detection_mode: str,
+    require_thermal: bool,
+):
     if rgb_image is None:
         return "Upload an RGB image to continue.", {}, "", None, None
 
-    # Fallback: if no thermal input is provided, derive grayscale thermal from RGB.
     if thermal_image is None:
+        if require_thermal:
+            return (
+                "NO PEDESTRIAN (thermal image required)",
+                {"no_pedestrian": 1.0, "pedestrian": 0.0},
+                "Upload real paired RGB + thermal images. RGB-only screenshots are rejected to avoid false positives.",
+                rgb_image.convert("RGB"),
+                None,
+            )
         thermal_image = rgb_image.convert("L")
-        thermal_note = "Thermal image not provided. Using RGB-derived grayscale fallback."
+        thermal_note = "Thermal image not provided. Using RGB-derived grayscale fallback (less reliable)."
     else:
         thermal_note = "Using uploaded RGB + thermal pair."
 
@@ -139,16 +167,34 @@ def predict(rgb_image: Image.Image, thermal_image: Image.Image | None):
         _, probs = MODEL(rgb_t, thm_t)
 
     ped_conf = float(probs[0, PEDESTRIAN_CLASS_IDX].item())
-    is_ped = ped_conf >= PEDESTRIAN_THRESHOLD
-    cam, box = gradcam_localization(rgb_t, thm_t)
+    no_ped_conf = float(probs[0, 1 - PEDESTRIAN_CLASS_IDX].item())
+    cam, box, cam_peak, box_area_ratio = gradcam_localization(rgb_t, thm_t)
+
+    if detection_mode == "strict":
+        is_ped = (
+            ped_conf >= pedestrian_threshold
+            and (ped_conf - no_ped_conf) >= ped_margin
+            and cam_peak >= cam_peak_threshold
+            and box_area_ratio >= min_box_area_ratio
+        )
+    elif detection_mode == "balanced":
+        is_ped = (
+            ped_conf >= pedestrian_threshold
+            and (ped_conf - no_ped_conf) >= ped_margin
+            and (cam_peak >= cam_peak_threshold or box_area_ratio >= min_box_area_ratio)
+        )
+    else:
+        # recall mode: prioritize detecting pedestrians
+        is_ped = ped_conf >= pedestrian_threshold
 
     rgb_out = apply_overlay(rgb_image, cam, box, draw_box=is_ped)
     thm_out = apply_overlay(thermal_image.convert("RGB"), cam, box, draw_box=is_ped)
 
     status = f"PEDESTRIAN DETECTED ({ped_conf:.2%})" if is_ped else f"NO PEDESTRIAN ({ped_conf:.2%})"
     thermal_note += (
-        " Fusion model mode (single pedestrian region). "
-        f"Threshold={PEDESTRIAN_THRESHOLD:.2f}."
+        f" Fusion model mode (single pedestrian region, mode={detection_mode}). "
+        f"Threshold={pedestrian_threshold:.2f}, margin={ped_margin:.2f}, "
+        f"cam_peak={cam_peak:.2f}, box_ratio={box_area_ratio:.3f}."
     )
     scores = {
         "no_pedestrian": round(float(probs[0, 0].item()), 4),
@@ -170,6 +216,22 @@ with gr.Blocks(title="Pedestrian Detection Web App") as demo:
         rgb_input = gr.Image(type="pil", label="RGB Image", height=320)
         thermal_input = gr.Image(type="pil", label="Thermal Image (Optional)", height=320)
 
+    with gr.Row():
+        detection_mode_input = gr.Dropdown(
+            choices=["strict", "balanced", "recall"],
+            value=DETECTION_MODE if DETECTION_MODE in {"strict", "balanced", "recall"} else "strict",
+            label="Detection Mode",
+        )
+        require_thermal_input = gr.Checkbox(value=REQUIRE_THERMAL, label="Require thermal image")
+
+    with gr.Row():
+        pedestrian_threshold_input = gr.Slider(0.0, 1.0, value=PEDESTRIAN_THRESHOLD, step=0.01, label="Pedestrian Threshold")
+        ped_margin_input = gr.Slider(0.0, 0.5, value=PED_MARGIN, step=0.01, label="Margin over non-pedestrian")
+
+    with gr.Row():
+        cam_peak_threshold_input = gr.Slider(0.0, 1.0, value=CAM_PEAK_THRESHOLD, step=0.01, label="CAM Peak Threshold")
+        min_box_area_ratio_input = gr.Slider(0.0, 0.2, value=MIN_BOX_AREA_RATIO, step=0.001, label="Minimum Box Area Ratio")
+
     predict_btn = gr.Button("Detect Pedestrian", variant="primary", size="lg")
 
     status_out = gr.Textbox(label="Detection Result", interactive=False)
@@ -180,7 +242,16 @@ with gr.Blocks(title="Pedestrian Detection Web App") as demo:
 
     predict_btn.click(
         fn=predict,
-        inputs=[rgb_input, thermal_input],
+        inputs=[
+            rgb_input,
+            thermal_input,
+            pedestrian_threshold_input,
+            ped_margin_input,
+            cam_peak_threshold_input,
+            min_box_area_ratio_input,
+            detection_mode_input,
+            require_thermal_input,
+        ],
         outputs=[status_out, scores_out, note_out, rgb_out, thm_out],
     )
 

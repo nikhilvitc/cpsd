@@ -11,6 +11,7 @@ def parse_args():
     p.add_argument("--kaist-root", required=True)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--img-size", type=int, default=224)
     p.add_argument("--val-split", type=float, default=0.2)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--checkpoint", default="best_model_kaist.pth")
@@ -30,6 +31,7 @@ def main():
         kaist_root=args.kaist_root,
         batch_size=args.batch_size,
         val_split=args.val_split,
+        img_size=args.img_size,
     )
     model = RGBThermalFusionNet(num_classes=NUM_CLASSES)
     train_model(model, tr_loader, va_loader, args.epochs, args.lr, device, args.checkpoint)

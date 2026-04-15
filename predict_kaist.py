@@ -26,6 +26,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rgb", required=True)
     p.add_argument("--thermal", required=True)
+    p.add_argument("--img-size", type=int, default=224)
     p.add_argument("--checkpoint", default="best_model_kaist.pth")
     args = p.parse_args()
 
@@ -45,8 +46,20 @@ def main():
     model.to(device)
     model.eval()
 
-    rgb = RGB_TF(Image.open(args.rgb).convert("RGB")).unsqueeze(0).to(device)
-    thm = THM_TF(Image.open(args.thermal).convert("L")).unsqueeze(0).to(device)
+    rgb_tf = transforms.Compose([
+        transforms.Resize((args.img_size, args.img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    thm_tf = transforms.Compose([
+        transforms.Resize((args.img_size, args.img_size)),
+        transforms.Grayscale(num_output_channels=1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5], std=[0.5]),
+    ])
+
+    rgb = rgb_tf(Image.open(args.rgb).convert("RGB")).unsqueeze(0).to(device)
+    thm = thm_tf(Image.open(args.thermal).convert("L")).unsqueeze(0).to(device)
 
     with torch.no_grad():
         _, probs = model(rgb, thm)
