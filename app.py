@@ -361,4 +361,11 @@ with gr.Blocks(title="Pedestrian Detection Web App") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(share=False, theme=gr.themes.Soft())
+    # Railway-compatible: read PORT from environment, default to 7876 locally.
+    port = int(os.environ.get("PORT", 7876))
+    demo.launch(
+        share=False,
+        server_name="0.0.0.0",
+        server_port=port,
+        theme=gr.themes.Soft()
+    )
